@@ -1,105 +1,163 @@
+# -*- coding: utf-8 -*-
+# @Author       : William
+# @Project      : TextGAN-william
+# @FileName     : cat_data_loader.py
+# @Time         : Created at 2019-05-31
+# @Blog         : http://zhiweil.ml/
+# @Description  : 
+# Copyrights (C) 2018. All Rights Reserved.
 
-import math
-import string
-
-import numpy as np
-import os
 import random
+from torch.utils.data import Dataset, DataLoader
 
-import config as cfg
-from metrics.basic import Metrics
-from utils.text_process import write_tokens
-
-kenlm_path = '/home/zhiwei/kenlm'  # specify the kenlm path
+from utils.text_process import *
 
 
-class PPL(Metrics):
-    def __init__(self, train_data, test_data, n_gram=5, if_use=False):
+class GANDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return len(self.data)
+
+
+class CatGenDataIter:
+    def __init__(self, samples_list, shuffle=None):
+        self.batch_size = cfg.batch_size
+        self.max_seq_len = cfg.max_seq_len
+        self.start_letter = cfg.start_letter
+        self.shuffle = cfg.data_shuffle if not shuffle else shuffle
+        if cfg.if_real_data:
+            self.word2idx_dict, self.idx2word_dict = load_dict(cfg.dataset)
+
+        self.loader = DataLoader(
+            dataset=GANDataset(self.__read_data__(samples_list)),
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            drop_last=True)
+
+        self.input = self._all_data_('input')
+        self.target = self._all_data_('target')
+        self.label = self._all_data_('label')  # from 0 to k-1, different from Discriminator label
+
+    def __read_data__(self, samples_list):
         """
-        Calculate Perplexity scores, including forward and reverse.
-        PPL-F: PPL_forward, PPL-R: PPL_reverse
-        @param train_data: train_data (GenDataIter)
-        @param test_data: test_data (GenDataIter)
-        @param n_gram: calculate with n-gram
-        @param if_use: if use
+        input: same as target, but start with start_letter.
         """
-        super(PPL, self).__init__('[PPL-F, PPL-R]')
+        inp, target, label = self.prepare(samples_list)
+        all_data = [{'input': i, 'target': t, 'label': l} for (i, t, l) in zip(inp, target, label)]
+        return all_data
 
-        self.n_gram = n_gram
-        self.if_use = if_use
+    def random_batch(self):
+        """Randomly choose a batch from loader, please note that the data should not be shuffled."""
+        idx = random.randint(0, len(self.loader) - 1)
+        return list(self.loader)[idx]
 
-        self.gen_tokens = None
-        self.train_data = train_data
-        self.test_data = test_data
+    def _all_data_(self, col):
+        return torch.cat([data[col].unsqueeze(0) for data in self.loader.dataset.data], 0)
 
-    def get_score(self):
-        if not self.if_use:
-            return 0
-        return self.cal_ppl()
+    def prepare(self, samples_list, gpu=False):
+        """Add start_letter to samples as inp, target same as samples"""
+        all_samples = torch.cat(samples_list, dim=0).long()
+        target = all_samples
+        inp = torch.zeros(all_samples.size()).long()
+        inp[:, 0] = self.start_letter
+        inp[:, 1:] = target[:, :self.max_seq_len - 1]
 
-    def reset(self, gen_tokens=None):
-        self.gen_tokens = gen_tokens
+        label = torch.zeros(all_samples.size(0)).long()
+        for idx in range(len(samples_list)):
+            start = sum([samples_list[i].size(0) for i in range(idx)])
+            label[start: start + samples_list[idx].size(0)] = idx
 
-    def cal_ppl(self):
-        save_path = os.path.join("/tmp", ''.join(random.choice(
-            string.ascii_uppercase + string.digits) for _ in range(6)))
-        output_path = save_path + ".arpa"
+        # shuffle
+        perm = torch.randperm(inp.size(0))
+        inp = inp[perm].detach()
+        target = target[perm].detach()
+        label = label[perm].detach()
 
-        write_tokens(save_path, self.gen_tokens)  # save to file
+        if gpu:
+            return inp.cuda(), target.cuda(), label.cuda()
+        return inp, target, label
 
-        # forward ppl
-        for_lm = self.train_ngram_lm(kenlm_path=kenlm_path, data_path=cfg.test_data,
-                                     output_path=output_path, n_gram=self.n_gram)
-        for_ppl = self.get_ppl(for_lm, self.gen_tokens)
+    def load_data(self, filename):
+        """Load real data from local file"""
+        self.tokens = get_tokenlized(filename)
+        samples_index = tokens_to_tensor(self.tokens, self.word2idx_dict)
+        return self.prepare(samples_index)
 
-        # reverse ppl
-        try:
-            rev_lm = self.train_ngram_lm(kenlm_path=kenlm_path, data_path=save_path,
-                                         output_path=output_path, n_gram=self.n_gram)
 
-            rev_ppl = self.get_ppl(rev_lm, self.test_data.tokens)
-        except:
-            # Note: Only after the generator is trained few epochs, the reverse ppl can be calculated.
-            rev_ppl = 0
+class CatClasDataIter:
+    """Classifier data loader, handle for multi label data"""
 
-        return [for_ppl, rev_ppl]
-
-    def train_ngram_lm(self, kenlm_path, data_path, output_path, n_gram):
+    def __init__(self, samples_list, given_target=None, shuffle=None):
         """
-        Trains a modified Kneser-Ney n-gram KenLM from a text file.
-        Creates a .arpa file to store n-grams.
+        - samples_list:  list of tensors, [label_0, label_1, ..., label_k]
         """
-        import kenlm
-        import subprocess
+        self.batch_size = cfg.batch_size
+        self.max_seq_len = cfg.max_seq_len
+        self.start_letter = cfg.start_letter
+        self.shuffle = cfg.data_shuffle if not shuffle else shuffle
 
-        # create .arpa and .bin file of n-grams
-        curdir = os.path.abspath(os.path.curdir)
-        cd_command = "cd " + os.path.join(kenlm_path, 'build')
-        command_1 = "bin/lmplz -o {} <{} >{} --discount_fallback &".format(str(n_gram), os.path.join(curdir, data_path),
-                                                                           output_path)
-        command_2 = "bin/build_binary -s {} {} &".format(output_path, output_path + ".bin")
+        self.loader = DataLoader(
+            dataset=GANDataset(self.__read_data__(samples_list, given_target)),
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            drop_last=True)
 
-        while True:
-            subprocess.getstatusoutput(cd_command + " && " + command_1)  # call without logging output
-            subprocess.getstatusoutput(cd_command + " && " + command_2)  # call without logging output
-            if os.path.exists(output_path + ".bin"):
-                break
+        self.input = self._all_data_('input')
+        self.target = self._all_data_('target')
 
-        # create language model
-        model = kenlm.Model(output_path + ".bin")
+    def __read_data__(self, samples_list, given_target=None):
+        inp, target = self.prepare(samples_list, given_target)
+        all_data = [{'input': i, 'target': t} for (i, t) in zip(inp, target)]
+        return all_data
 
-        return model
+    def random_batch(self):
+        idx = random.randint(0, len(self.loader) - 1)
+        return list(self.loader)[idx]
+        # return next(iter(self.loader))
 
-    def get_ppl(self, lm, tokens):
+    def _all_data_(self, col):
+        return torch.cat([data[col].unsqueeze(0) for data in self.loader.dataset.data], 0)
+
+    @staticmethod
+    def prepare(samples_list, given_target=None, detach=True, gpu=False):
         """
-        Assume sentences is a list of strings (space delimited sentences)
+        Build inp and target
+        :param samples_list: list of tensors, [label_0, label_1, ..., label_k]
+        :param given_target: given a target, len(samples_list) = 1
+        :param detach: if detach input
+        :param gpu: if use cuda
+        :returns inp, target:
+            - inp: sentences
+            - target: label index, 0-label_0, 1-label_1, ..., k-label_k
         """
-        total_nll = 0
-        total_wc = 0
-        for words in tokens:
-            nll = np.sum([-math.log(math.pow(10.0, score))
-                          for score, _, _ in lm.full_scores(' '.join(words), bos=True, eos=False)])
-            total_wc += len(words)
-            total_nll += nll
-        ppl = np.exp(total_nll / total_wc)
-        return round(ppl, 4)
+        if len(samples_list) == 1 and given_target is not None:
+            inp = samples_list[0]
+            if detach:
+                inp = inp.detach()
+            target = torch.LongTensor([given_target] * inp.size(0))
+            if len(inp.size()) == 2:  # samples token, else samples onehot
+                inp = inp.long()
+        else:
+            inp = torch.cat(samples_list, dim=0)  # !!!need .detach()
+            if detach:
+                inp = inp.detach()
+            target = torch.zeros(inp.size(0)).long()
+            if len(inp.size()) == 2:  # samples token, else samples onehot
+                inp = inp.long()
+            for idx in range(1, len(samples_list)):
+                start = sum([samples_list[i].size(0) for i in range(idx)])
+                target[start: start + samples_list[idx].size(0)] = idx
+
+        # shuffle
+        perm = torch.randperm(inp.size(0))
+        inp = inp[perm]
+        target = target[perm]
+
+        if gpu:
+            return inp.cuda(), target.cuda()
+        return inp, target
