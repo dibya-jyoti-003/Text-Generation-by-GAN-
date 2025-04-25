@@ -124,17 +124,7 @@ if __name__ == '__main__':
         from instructor.oracle_data.leakgan_instructor import LeakGANInstructor
 
     instruction_dict = {
-        'seqgan': SeqGANInstructor,
         'leakgan': LeakGANInstructor,
-        'maligan': MaliGANInstructor,
-        'jsdgan': JSDGANInstructor,
-        'dpgan': DPGANInstructor,
-        'relgan': RelGANInstructor,
-        'sentigan': SentiGANInstructor,
-        'evogan': EvoGANInstructor,
-        'catgan': CatGANInstructor,
-        'dgsan': DGSANInstructor,
-        'cot': CoTInstructor,
     }
 
     inst = instruction_dict[cfg.run_model](opt)
